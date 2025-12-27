@@ -80,10 +80,10 @@ def get_dataset_from_hf(
     hf_dataset_repo_name: str,
     split: str,
     silent: bool = False,
-    cache_dir: str = None,
-    base_data_dir: str = None,
+    cache_dir: Optional[str] = None,
+    base_data_dir: Optional[str] = None,
 ):
-    data = defaultdict(lambda: defaultdict(list))
+    data: Dict[str, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
     data_iter: Iterator[Dict]
 
     print(f"Loading {hf_dataset_repo_name} dataset ({split} split) from HF...")
@@ -97,6 +97,8 @@ def get_dataset_from_hf(
         prompt = example["chosen"][:-1]
         chosen = example["chosen"][-1]
         rejected = example["rejected"][-1]
+        assert chosen["role"] == "assistant"
+        assert rejected["role"] == "assistant"
 
         responses = [chosen, rejected]
 
@@ -109,125 +111,74 @@ def get_dataset_from_hf(
 
 
 def tokenize_batch_element(
-    prompt: str,
-    chosen: str,
-    rejected: str,
-    truncation_mode: str,
+    prompt: dict,
+    chosen: dict,
+    rejected: dict,
     tokenizer,
     max_length: int,
-    max_prompt_length: int,
-    rejected_weight=None,
-    chosen_weight=None,
-) -> Dict:
-    """Tokenize a single batch element.
+) -> Optional[Dict]:
+    """ """
+    # Data quality check: we don't want EOS appear at the middle of the prompt or response
+    raw_prompt_tokens = tokenizer(prompt["content"], add_special_tokens=False)
+    raw_chosen_tokens = tokenizer(chosen["content"], add_special_tokens=False)
+    raw_rejected_tokens = tokenizer(rejected["content"], add_special_tokens=False)
 
-    At this stage, we don't convert to PyTorch tensors yet; we just handle the truncation
-      in case the prompt + chosen or prompt + rejected responses is/are too long. First
-      we truncate the prompt; if we're still too long, we truncate the chosen/rejected.
-
-    We also create the labels for the chosen/rejected responses, which are of length equal to
-      the sum of the length of the prompt and the chosen/rejected response, with -100 for the
-      prompt tokens.
-    """
-    chosen_tokens = tokenizer(chosen, add_special_tokens=False)
-    # len(chosen_tokens['input_ids'])  104
-    rejected_tokens = tokenizer(rejected, add_special_tokens=False)
-    prompt_tokens = tokenizer(prompt, add_special_tokens=False)
-
-    if rejected_weight is not None:
-        assert len(rejected_weight) == len(rejected_tokens["input_ids"])
-
-    if chosen_weight is not None:
-        assert len(chosen_weight) == len(chosen_tokens["input_ids"])
-
-    assert tokenizer.eos_token_id not in prompt_tokens["input_ids"], (
+    assert tokenizer.eos_token_id not in raw_prompt_tokens["input_ids"], (
         f"Prompt contains EOS token: {prompt}"
     )
-    assert tokenizer.eos_token_id not in chosen_tokens["input_ids"], (
+    assert tokenizer.eos_token_id not in raw_chosen_tokens["input_ids"], (
         f"Chosen response contains EOS token: {chosen}"
     )
-    assert tokenizer.eos_token_id not in rejected_tokens["input_ids"], (
+    assert tokenizer.eos_token_id not in raw_rejected_tokens["input_ids"], (
         f"Rejected response contains EOS token: {rejected}"
     )
 
-    chosen_tokens["input_ids"].append(tokenizer.eos_token_id)
-    chosen_tokens["attention_mask"].append(1)
+    chosen_message = [prompt] + [chosen]
+    rejected_message = [prompt] + [rejected]
 
-    rejected_tokens["input_ids"].append(tokenizer.eos_token_id)
-    rejected_tokens["attention_mask"].append(1)
+    chosen_template_message = tokenizer.apply_chat_template(
+        chosen_message, add_generation_prompt=False, tokenize=False
+    )
+    rejected_template_message = tokenizer.apply_chat_template(
+        rejected_message, add_generation_prompt=False, tokenize=False
+    )
+    prompt_template_message = tokenizer.apply_chat_template(
+        [prompt], add_generation_prompt=True, tokenize=False
+    )
 
-    longer_response_length = max(len(chosen_tokens["input_ids"]), len(rejected_tokens["input_ids"]))
+    prompt_sequence_tokens = tokenizer(prompt_template_message, add_special_tokens=False)
+    chosen_sequence_tokens = tokenizer(chosen_template_message, add_special_tokens=False)
+    rejected_sequence_tokens = tokenizer(rejected_template_message, add_special_tokens=False)
 
-    # if combined sequence is too long, truncate the prompt
-    if len(prompt_tokens["input_ids"]) + longer_response_length > max_length:
-        if truncation_mode == "keep_start":
-            prompt_tokens = {k: v[:max_prompt_length] for k, v in prompt_tokens.items()}
-        elif truncation_mode == "keep_end":
-            prompt_tokens = {k: v[-max_prompt_length:] for k, v in prompt_tokens.items()}
-        else:
-            raise ValueError(f"Unknown truncation mode: {truncation_mode}")
+    # discard the sample if too long
+    longer_response_length = max(
+        len(chosen_sequence_tokens["input_ids"]), len(rejected_sequence_tokens["input_ids"])
+    )
+    if longer_response_length > max_length:
+        return None
 
-    # if that's still too long, truncate the response
-    if len(prompt_tokens["input_ids"]) + longer_response_length > max_length:
-        # print('truncate=====', len(chosen_tokens['input_ids']), len(rejected_tokens['input_ids']))
-        chosen_tokens = {k: v[: max_length - max_prompt_length] for k, v in chosen_tokens.items()}
-        rejected_tokens = {
-            k: v[: max_length - max_prompt_length] for k, v in rejected_tokens.items()
-        }
-
-    # Create labels
-    chosen_sequence_tokens = {k: prompt_tokens[k] + chosen_tokens[k] for k in chosen_tokens}
-    rejected_sequence_tokens = {k: prompt_tokens[k] + rejected_tokens[k] for k in rejected_tokens}
+    # Create labels (we don't want to compute loss on prompt tokens)
     chosen_sequence_tokens["labels"] = chosen_sequence_tokens["input_ids"][:]
-    chosen_sequence_tokens["labels"][: len(prompt_tokens["input_ids"])] = [-100] * len(
-        prompt_tokens["input_ids"]
+    chosen_sequence_tokens["labels"][: len(prompt_sequence_tokens["input_ids"])] = [-100] * len(
+        prompt_sequence_tokens["input_ids"]
     )
     rejected_sequence_tokens["labels"] = rejected_sequence_tokens["input_ids"][:]
-    rejected_sequence_tokens["labels"][: len(prompt_tokens["input_ids"])] = [-100] * len(
-        prompt_tokens["input_ids"]
+    rejected_sequence_tokens["labels"][: len(prompt_sequence_tokens["input_ids"])] = [-100] * len(
+        prompt_sequence_tokens["input_ids"]
     )
 
     batch = {}
 
-    if rejected_weight is not None:
-        batch["rejected_weight"] = (
-            [0] * len(prompt_tokens["input_ids"])
-            + rejected_weight[: len(rejected_tokens["input_ids"]) - 1]
-            + [0]
-        )
-    else:
-        batch["rejected_weight"] = (
-            [0] * len(prompt_tokens["input_ids"])
-            + [1] * (len(rejected_tokens["input_ids"]) - 1)
-            + [0]
-        )
-
-    if chosen_weight is not None:
-        batch["chosen_weight"] = (
-            [0] * len(prompt_tokens["input_ids"])
-            + chosen_weight[: len(chosen_tokens["input_ids"]) - 1]
-            + [0]
-        )
-    else:
-        batch["chosen_weight"] = (
-            [0] * len(prompt_tokens["input_ids"])
-            + [1] * (len(chosen_tokens["input_ids"]) - 1)
-            + [0]
-        )
-
-    assert len(batch["chosen_weight"]) == len(chosen_sequence_tokens["labels"])
-    assert len(batch["rejected_weight"]) == len(rejected_sequence_tokens["labels"])
-
-    batch["prompt"] = prompt
-    batch["chosen"] = prompt + chosen
-    batch["rejected"] = prompt + rejected
-    batch["chosen_response_only"] = chosen
-    batch["rejected_response_only"] = rejected
+    batch["prompt"] = [prompt]
+    batch["chosen"] = [prompt] + [chosen]
+    batch["rejected"] = [prompt] + [rejected]
+    batch["chosen_response_only"] = [chosen]
+    batch["rejected_response_only"] = [rejected]
 
     for k, toks in {
         "chosen": chosen_sequence_tokens,
         "rejected": rejected_sequence_tokens,
-        "prompt": prompt_tokens,
+        "prompt": prompt_sequence_tokens,
     }.items():
         for type_key, tokens in toks.items():
             if type_key == "token_type_ids":
@@ -393,6 +344,8 @@ def get_batch_iterator(
                     max_length,
                     max_prompt_length,
                 )
+                if batch_element is None:
+                    continue
                 batch_element = {k: v for k, v in batch_element.items() if "rejected" not in k}
                 batch.append(batch_element)
                 example_idx += 1
@@ -421,6 +374,8 @@ def get_batch_iterator(
                         rejected_weight_item,
                         chosen_weight_item,
                     )
+                    if batch_element is None:
+                        continue
                     batch.append(batch_element)
                     example_idx += 1
                     if len(batch) == batch_size:
