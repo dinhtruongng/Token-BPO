@@ -9,11 +9,11 @@ import random
 import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
+
 import numpy as np
 import tensor_parallel as tp
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 import tqdm
 import transformers
 import wandb
@@ -35,35 +35,29 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
+from loss.h_function import make_h
+from loss.loss import (
+    bregman_loss,
+    preference_loss,
+    tdpo_loss,
+    tisdpo_loss,
+)
+from loss.loss_utils import (
+    Q_tbpo_get_batch_logps,
+    _get_batch_logps,
+    _get_batch_logps_tisdpo,
+    _tdpo_get_batch_logps,
+)
 from preference_datasets import get_batch_iterator
 from utils import (
     all_gather_if_needed,
+    concatenated_inputs,
     formatted_dict,
     get_block_class_from_model,
     pad_to_length,
     rank0_print,
     slice_and_move_batch_for_device,
-    concatenated_inputs,
 )
-from loss.loss import (
-    tdpo_loss,
-    tisdpo_loss,
-    preference_loss,
-)
-
-from loss.loss_utils import (
-    _get_batch_logps,
-    _get_batch_logps_tisdpo,
-    _tdpo_get_batch_logps,
-    Q_tbpo_get_batch_logps,
-    A_tbpo_get_batch_logps,
-)
-
-
-
-
-
-
 
 
 class BasicTrainer(object):
@@ -296,12 +290,13 @@ class BasicTrainer(object):
             chosen_logps,
             rejected_logps,
         )
-    
+
     def Q_tbpo_concatenated_forward(
-        self, 
-        model: nn.Module, 
-        reference_model: nn.Module, 
-        batch: Dict[str, Union[List, torch.LongTensor]]
+        self,
+        model: nn.Module,
+        reference_model: nn.Module,
+        batch: Dict[str, Union[List, torch.LongTensor]],
+        loss_mask: torch.Tensor,
     ):
         """
         Compute R_theta
@@ -313,33 +308,55 @@ class BasicTrainer(object):
             output_hidden_states=True,
         )
         all_logits = outputs.logits.to(torch.float32)
-        all_hidden_states = outputs.hidden_states[-1].to(torch.float32)
+        all_last_hidden_states = outputs.hidden_states[-1].to(torch.float32)
 
         with torch.no_grad():
             reference_all_logits = reference_model(
                 concatenated_batch["concatenated_input_ids"],
                 attention_mask=concatenated_batch["concatenated_attention_mask"],
             ).logits.to(torch.float32)
-        
+
+        labels = concatenated_batch["concatenated_labels"][:, 1:].clone()
+        per_sample_mask = labels != -100
+
         all_logps_margin, all_logps = Q_tbpo_get_batch_logps(
             all_logits,
             reference_all_logits,
             concatenated_batch["concatenated_labels"],
-            average_log_prob=False,
         )
+
+        all_logps = all_logps * per_sample_mask
 
         chosen_logps_margin = all_logps_margin[: batch["chosen_input_ids"].shape[0]]
         rejected_logps_margin = all_logps_margin[batch["chosen_input_ids"].shape[0] :]
 
-        chosen_logps = all_logps[: batch["chosen_input_ids"].shape[0]].detach()
-        rejected_logps = all_logps[batch["chosen_input_ids"].shape[0] :].detach()
+        all_last_hidden_states_detached = all_last_hidden_states.detach()
+        all_baselines = self.policy.baseline_head(all_last_hidden_states_detached)
+        chosen_baselines = all_baselines[: batch["chosen_input_ids"].shape[0]]
+        rejected_baselines = all_baselines[batch["chosen_input_ids"].shape[0] :]
+        # align to token-prediction positions: logits[:, :-1] predicts labels[:, 1:]
+        b_chosen = chosen_baselines[:, :-1]
+        b_rejected = rejected_baselines[:, :-1]
+        log_w = b_rejected - b_chosen
+        mean_logw_per_prompt = (log_w * loss_mask).sum(-1) / loss_mask.sum(-1)
+        # center w
+        log_w = log_w - mean_logw_per_prompt.unsqueeze(-1)
+        log_w = log_w.clamp(self.config.model.baseline_l, self.config.model.baseline_u)
 
-    
+        # R_theta
+        beta = self.config.loss.beta
+        log_R = beta * (rejected_logps_margin - chosen_logps_margin + log_w)
+
+        chosen_logps = beta * (all_logps[: batch["chosen_input_ids"].shape[0]].detach()).sum(-1)
+        rejected_logps = beta * (all_logps[batch["chosen_input_ids"].shape[0] :].detach()).sum(-1)
+
+        return log_R, chosen_logps, rejected_logps
+
     def A_tbpo_concatenated_forward(
-        self, 
-        model: nn.Module, 
-        reference_model: nn.Module, 
-        batch: Dict[str, Union[List, torch.LongTensor]]
+        self,
+        model: nn.Module,
+        reference_model: nn.Module,
+        batch: Dict[str, Union[List, torch.LongTensor]],
     ):
         """Compute R_theta"""
 
@@ -353,12 +370,6 @@ class BasicTrainer(object):
                 concatenated_batch["concatenated_input_ids"],
                 attention_mask=concatenated_batch["concatenated_attention_mask"],
             ).logits.to(torch.float32)
-        
-
-        
-
-        
-
 
     def get_batch_metrics(
         self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True
@@ -537,9 +548,13 @@ class BasicTrainer(object):
             )
 
             losses = -policy_chosen_logps
-        
-        elif loss_config.name == "tbpo":
 
+        elif loss_config.name == "Q_tbpo":
+            loss_mask = 
+            log_R, policy_chosen_logps, policy_rejected_logps = self.Q_tbpo_concatenated_forward(
+                self.policy, self.reference_model, batch, loss_mask
+            )
+            losses = bregman_loss(log_R, loss_mask, h_func=make_h(**loss_config.bregman_loss))
 
         policy_chosen_logps = all_gather_if_needed(
             policy_chosen_logps.detach(), self.rank, self.world_size
@@ -794,7 +809,6 @@ class FSDPTrainer(BasicTrainer):
             reference_model,
             rank,
             world_size,
-            transform_config=transform_config,
         )
         assert config.model.block_name is not None, (
             "must specify model.block_name (e.g., GPT2Block or GPTNeoXLayer) for FSDP"

@@ -3,6 +3,20 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
+from loss.h_function import HFunc
+
+
+def bregman_loss(
+    log_R: torch.Tensor,
+    loss_mask: torch.Tensor,
+    h_func: HFunc,
+):
+    per_token = h_func.loss_from_logR(log_R)
+    per_token = per_token * loss_mask
+
+    denom = loss_mask.sum(dim=1).clamp_min(1.0)
+    return per_token.sum(dim=1) / denom
+
 
 def tdpo_loss(
     chosen_logps_margin: torch.FloatTensor,

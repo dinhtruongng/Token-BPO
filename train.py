@@ -1,5 +1,7 @@
 import torch
 
+from baseline_head import BaselineHead
+
 torch.backends.cuda.matmul.allow_tf32 = True
 import os
 import resource
@@ -115,6 +117,15 @@ def main(config: DictConfig):
     policy = transformers.AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path, low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs
     )
+    if config.model.use_baseline_head:
+        hidden_size = getattr(policy.config, "hidden_size", None) or getattr(
+            policy.config, "n_embd"
+        )
+        policy.baseline_head = BaselineHead(
+            hidden_size=hidden_size,
+            mlp_dim=config.model.baseline_mlp_dim,
+            dropout=config.model.baseline_dropout,
+        )
     disable_dropout(policy)
 
     if config.loss.name in {"dpo", "ipo", "tdpo", "tisdpo", "tbpo"}:

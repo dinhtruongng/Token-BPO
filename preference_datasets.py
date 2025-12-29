@@ -81,7 +81,7 @@ def tokenize_batch_element(
         rejected_message, add_generation_prompt=False, tokenize=False
     )
     prompt_template_message = tokenizer.apply_chat_template(
-        prompt, add_generation_prompt=True, tokenize=False
+        prompt, add_generation_prompt=False, tokenize=False
     )
 
     prompt_sequence_tokens = tokenizer(prompt_template_message, add_special_tokens=False)

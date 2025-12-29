@@ -5,7 +5,6 @@ def Q_tbpo_get_batch_logps(
     logits: torch.FloatTensor,
     reference_logits: torch.FloatTensor,
     labels: torch.LongTensor,
-    average_log_prob: bool = False,
 ):
     assert logits.shape[:-1] == labels.shape
     assert reference_logits.shape[:-1] == labels.shape
@@ -13,8 +12,6 @@ def Q_tbpo_get_batch_logps(
     labels = labels[:, 1:].clone()
     logits = logits[:, :-1, :]
     reference_logits = reference_logits[:, :-1, :]
-
-    loss_mask = labels != -100
 
     # dummy token; we'll ignore the losses on these tokens later
     labels[labels == -100] = 0
@@ -28,16 +25,10 @@ def Q_tbpo_get_batch_logps(
 
     logps_margin = per_token_logps - per_reference_token_logps
 
-    if average_log_prob:
-        return (
-            (logps_margin * loss_mask).sum(-1) / loss_mask.sum(-1),
-            (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1),
-        )
-    else:
-        return (
-            (logps_margin * loss_mask).sum(-1),
-            (per_token_logps * loss_mask).sum(-1),
-        )
+    return (
+        logps_margin,
+        per_token_logps,
+    )
 
 
 def A_tbpo_get_batch_logps(
@@ -46,6 +37,7 @@ def A_tbpo_get_batch_logps(
     labels: torch.LongTensor,
     average_log_prob: bool = False,
 ):
+    """also return token KL"""
     pass
 
 
