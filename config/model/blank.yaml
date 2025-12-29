@@ -20,3 +20,7 @@ fsdp_policy_mp: null
 
 # the dtype for the reference model (which is used for inference only)
 reference_dtype: float16
+
+use_baseline_head: false
+baseline_mlp_dim: 0
+baseline_dropout: 0.2
