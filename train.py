@@ -9,11 +9,11 @@ from typing import Optional, Set
 import hydra
 import torch.multiprocessing as mp
 import torch.nn as nn
-import trainers
 import transformers
 import wandb
 from omegaconf import DictConfig, OmegaConf
-from transform_config import TransformConfig, get_transform_config
+
+import trainers
 from utils import (
     build_exp_name,
     disable_dropout,
@@ -28,8 +28,10 @@ OmegaConf.register_new_resolver(
 )
 OmegaConf.register_new_resolver(
     "build_exp_name",
-    lambda loss_name, model_name, datasets, reverse_dataset, transform: build_exp_name(
-        loss_name, model_name, datasets, reverse_dataset, transform
+    lambda loss_name, model_name, datasets: build_exp_name(
+        loss_name,
+        model_name,
+        datasets,
     ),
 )
 
@@ -59,10 +61,6 @@ def worker_main(
             name=config.exp_name,
         )
 
-    # Convert transform configuration to a proper object if needed
-    # if 'transform' in config and isinstance(config.transform, (dict, str)):
-    transform_config = get_transform_config(config.transform)
-
     TrainerClass = getattr(trainers, config.trainer)
     print(f"Creating trainer on process {rank} with world size {world_size}")
     trainer = TrainerClass(
@@ -73,7 +71,6 @@ def worker_main(
         reference_model=reference_model,
         rank=rank,
         world_size=world_size,
-        transform_config=transform_config,
     )
 
     trainer.train()
@@ -83,30 +80,6 @@ def worker_main(
 @hydra.main(version_base=None, config_path="config", config_name="config")
 def main(config: DictConfig):
     """Main entry point for training. Validates config, creates/initializes model(s), and kicks off worker process(es)."""
-
-    # Load transform configuration before resolving experiment name
-    if isinstance(config.transform, str):
-        # Check if it's a path to a configuration file
-        if os.path.exists(config.transform) and config.transform.endswith(".yaml"):
-            transform_config = TransformConfig.from_file(config.transform)
-            print(f"Loaded transform configuration from {config.transform}")
-        # Check if it's a preset name
-        elif os.path.exists(f"config/transform/{config.transform}.yaml"):
-            transform_config = TransformConfig.from_preset(config.transform)
-            print(f"Loaded transform configuration preset: {config.transform}")
-        # Otherwise it's just a method name
-        else:
-            transform_config = TransformConfig(method=config.transform)
-            print(f"Using transform method: {config.transform}")
-    else:
-        # Using the default configuration from OmegaConf
-        transform_config = config.transform
-        print("Using transform configuration from config file")
-
-    # Update config.transform with the full config object for experiment naming
-    config.transform = (
-        transform_config.to_dict() if hasattr(transform_config, "to_dict") else transform_config
-    )
 
     # Now resolve hydra references with the updated transform config
     OmegaConf.resolve(config)
@@ -125,11 +98,6 @@ def main(config: DictConfig):
         print("no FSDP port specified; using open port for FSDP:", free_port)
         config.fsdp_port = free_port
 
-    # Print transform configuration details
-    method = transform_config.get("method", "origin")
-    print(f"Transform method: {method}")
-    if method in transform_config:
-        print(f"Transform parameters: {transform_config[method]}")
     print(OmegaConf.to_yaml(config))
 
     config_path = os.path.join(config.local_run_dir, "config.yaml")
@@ -149,7 +117,7 @@ def main(config: DictConfig):
     )
     disable_dropout(policy)
 
-    if config.loss.name in {"dpo", "ipo", "tdpo", "tisdpo"}:
+    if config.loss.name in {"dpo", "ipo", "tdpo", "tisdpo", "tbpo"}:
         print("building reference model")
         reference_model_dtype = getattr(torch, config.model.reference_dtype)
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(

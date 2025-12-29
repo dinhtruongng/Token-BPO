@@ -21,8 +21,6 @@ def build_exp_name(
     loss_name: str,
     model_name: str,
     datasets: Union[str, List[str]],
-    reverse_dataset: bool,
-    transform: str,
 ) -> str:
     """Build experiment name by combining loss name, model name, and dataset name(s)."""
     # Extract the model name without path
@@ -30,41 +28,9 @@ def build_exp_name(
 
     dataset_part = "_".join(datasets)
 
-    # Add 'reverse' suffix if loss is dpo and reverse_dataset is True
-    if loss_name == "dpo" and reverse_dataset:
-        return f"{loss_name}_{model_short_name}_{dataset_part}_reverse"
-
-    # Process transform info
-
-    method = transform.get("method", "origin")
-    params = transform.get(method, {})
-
-    # Include key parameters in name based on transform method
-    if method == "binary":
-        top_percent = params.get("top_percent", 100)
-        transform_str = f"{method}{top_percent}"
-    elif method == "threshold":
-        upper = params.get("upper_threshold", 1.0)
-        lower = params.get("lower_threshold", -1.0)
-        transform_str = f"{method}{upper}_{lower}"
-    elif method == "threshold_and_scale":
-        min_scale = params.get("min_scale", 0.7)
-        max_scale = params.get("max_scale", 1.3)
-        transform_str = f"{method}{min_scale}_{max_scale}"
-    elif method == "random":
-        min_val = params.get("min_val", 0.7)
-        max_val = params.get("max_val", 1.3)
-        transform_str = f"{method}{min_val}_{max_val}"
-    elif method == "rank_based":
-        min_scale = params.get("min_scale", 0.7)
-        max_scale = params.get("max_scale", 1.3)
-        transform_str = f"{method}{min_scale}_{max_scale}"
-    else:
-        transform_str = method
-
     # import ipdb; ipdb.set_trace()
     if loss_name == "tisdpo":
-        return f"{loss_name}_{model_short_name}_{dataset_part}_{transform_str}"
+        return f"{loss_name}_{model_short_name}_{dataset_part}"
 
     return f"{loss_name}_{model_short_name}_{dataset_part}"
 
@@ -194,6 +160,40 @@ def init_distributed(
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend, rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
+
+
+def concatenated_inputs(
+    batch: Dict[str, Union[List, torch.LongTensor]],
+) -> Dict[str, torch.LongTensor]:
+    """Concatenate the chosen and rejected inputs into a single tensor.
+
+    Args:
+        batch: A batch of data. Must contain the keys 'chosen_input_ids' and 'rejected_input_ids', which are tensors of shape (batch_size, sequence_length).
+
+    Returns:
+        A dictionary containing the concatenated inputs under the key 'concatenated_input_ids'.
+    """
+    max_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
+    concatenated_batch = {}
+    for k in batch:
+        if k.startswith("chosen") and isinstance(batch[k], torch.Tensor):
+            pad_value = -100 if "labels" in k else 0
+            concatenated_key = k.replace("chosen", "concatenated")
+            concatenated_batch[concatenated_key] = pad_to_length(
+                batch[k], max_length, pad_value=pad_value
+            )
+    for k in batch:
+        if k.startswith("rejected") and isinstance(batch[k], torch.Tensor):
+            pad_value = -100 if "labels" in k else 0
+            concatenated_key = k.replace("rejected", "concatenated")
+            concatenated_batch[concatenated_key] = torch.cat(
+                (
+                    concatenated_batch[concatenated_key],
+                    pad_to_length(batch[k], max_length, pad_value=pad_value),
+                ),
+                dim=0,
+            )
+    return concatenated_batch
 
 
 class TemporarilySeededRandom:
