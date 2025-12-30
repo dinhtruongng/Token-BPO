@@ -196,6 +196,19 @@ def concatenated_inputs(
     return concatenated_batch
 
 
+def compute_tbpo_loss_mask(batch: Dict[str, Union[List, torch.LongTensor]], concatenated_batch):
+    """only compute loss to the length of shorter sequence"""
+    chosen_labels = concatenated_batch["concatenated_labels"][: batch["chosen_input_ids"].shape[0]]
+    rejected_labels = concatenated_batch["concatenated_labels"][
+        batch["chosen_input_ids"].shape[0] :
+    ]
+    chosen_labels = chosen_labels[:, 1:]
+    rejected_labels = rejected_labels[:, 1:]
+    chosen_mask = chosen_labels != -100
+    rejected_mask = rejected_labels != -100
+    return chosen_mask & rejected_mask
+
+
 class TemporarilySeededRandom:
     def __init__(self, seed):
         """Temporarily set the random seed, and then restore it when exiting the context."""

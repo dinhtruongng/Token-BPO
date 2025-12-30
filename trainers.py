@@ -51,6 +51,7 @@ from loss.loss_utils import (
 from preference_datasets import get_batch_iterator
 from utils import (
     all_gather_if_needed,
+    compute_tbpo_loss_mask,
     concatenated_inputs,
     formatted_dict,
     get_block_class_from_model,
@@ -296,7 +297,6 @@ class BasicTrainer(object):
         model: nn.Module,
         reference_model: nn.Module,
         batch: Dict[str, Union[List, torch.LongTensor]],
-        loss_mask: torch.Tensor,
     ):
         """
         Compute R_theta
@@ -318,6 +318,7 @@ class BasicTrainer(object):
 
         labels = concatenated_batch["concatenated_labels"][:, 1:].clone()
         per_sample_mask = labels != -100
+        loss_mask = compute_tbpo_loss_mask(batch, concatenated_batch)
 
         all_logps_margin, all_logps = Q_tbpo_get_batch_logps(
             all_logits,
@@ -350,7 +351,7 @@ class BasicTrainer(object):
         chosen_logps = beta * (all_logps[: batch["chosen_input_ids"].shape[0]].detach()).sum(-1)
         rejected_logps = beta * (all_logps[batch["chosen_input_ids"].shape[0] :].detach()).sum(-1)
 
-        return log_R, chosen_logps, rejected_logps
+        return log_R, chosen_logps, rejected_logps, loss_mask
 
     def A_tbpo_concatenated_forward(
         self,
@@ -550,11 +551,18 @@ class BasicTrainer(object):
             losses = -policy_chosen_logps
 
         elif loss_config.name == "Q_tbpo":
-            loss_mask = 
-            log_R, policy_chosen_logps, policy_rejected_logps = self.Q_tbpo_concatenated_forward(
-                self.policy, self.reference_model, batch, loss_mask
+            log_R, policy_chosen_logps, policy_rejected_logps, loss_mask = (
+                self.Q_tbpo_concatenated_forward(self.policy, self.reference_model, batch)
             )
             losses = bregman_loss(log_R, loss_mask, h_func=make_h(**loss_config.bregman_loss))
+
+            policy_rejected_logps = all_gather_if_needed(
+                policy_rejected_logps.detach(), self.rank, self.world_size
+            )
+            metrics[f"logps_{train_test}/rejected"] = policy_rejected_logps.cpu().numpy().tolist()
+
+        elif loss_config.name == "A_tbpo":
+            pass
 
         policy_chosen_logps = all_gather_if_needed(
             policy_chosen_logps.detach(), self.rank, self.world_size
